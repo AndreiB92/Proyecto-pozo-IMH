@@ -1,0 +1,243 @@
+                        
+int pBytes; // Variable para guardar la lectura del sensor de presion KELLER26Y en bytes
+float pmBar; // variable creada para convertir el valor en presión
+float NivelAgua; // variable usada para guardar el valor de la presion en metros columna de agua en el pozo
+float volAgua;//variable usada para guardar el volumen de agua (litros) en el deposito
+int rangeBat; //variable que indica que la bateria esta en el rango de funcionamiento del motor. Para ponerse en marcha la bateria debe superar el 60% (range1=1) de su capacidad, y funciona hasta descargarse al 30% (range1=0)
+int rangeTank; //variable que indica que el deposito esta en el rango de funcionamiento del motor. Empieza en marcha(range2=1) estando al 0% y funciona hasta llegar al 99% (range2=0), y no vuelve a entrar en marcha hasta descender al 95% (range2=1)
+
+int analogValor;// Seteamos a cero en un principio el valor del valor analogico donde se mide la bateria a cero
+float voltajeArd; // Variable donde se almacena el valor del voltaje de la bateria en escala de 0 a 5V (siendo 0V para 0V de bateria, y 5V para 100V de bateria)
+float voltajeBat;// Variable del que indica el voltaje de la bateria
+float cargaBat100; // Variable que indica el porcentaje de carga de la bateria
+
+int estadoMotor; // variable que indica si el motor está ON o OFF
+
+#include "SR04.h"//ultrasound library
+#include <LoRa.h>// LoRa library
+#include <SPI.h>
+#define TRIG_PIN 12
+#define ECHO_PIN 11
+#define KELLER26Y A2
+#define M_ON 13   
+#define PILA A1
+#define PI 3.141592 // definimos el numero PI, lo utilizaremos para calcular el area del deposito
+#define HDEP 200 // [Cm] altura deposito en metros 
+#define RDEP 200// [Cm] radio del deposito
+
+// Caudalimetro jdhlabstech 
+const int sensorPin = 2; // Pin del sensor donde se mide la frecuencia para el caudalímetro
+const int measureInterval = 2500;// Tiempo de muestreo (Caudalímetro)
+volatile int pulseConter; // Contador de pulsos (Caudalimetro)
+const float factorK = 0.2; // Factor K propio del fabricante del caudalimetro
+
+
+//sensor ultrasonidos deposito
+SR04 sr04 = SR04(ECHO_PIN,TRIG_PIN);
+long aire_dep; //[Cm] valor del aire en el deposito 
+long agua_dep; //[Cm] altura del agua en el deposito
+
+
+void setup() {
+  
+    Serial.begin(9600); //sets the baud rate for data transfer in bits/second
+
+    attachInterrupt(digitalPinToInterrupt(sensorPin), ISRCountPulse, RISING); // Define donde será la interrupción
+  
+    pinMode(M_ON,OUTPUT); // Motor on will be an output 
+    pinMode(KELLER26Y, INPUT); // Defines the water presure sensor as an input
+    pinMode(PILA, INPUT); 
+    pinMode(TRIG_PIN,OUTPUT);
+    pinMode(ECHO_PIN,INPUT);
+    
+    rangeBat=0;// inicializamos rango de la bateria a 0
+    rangeTank=1;// inicializamos rango del deposito a 1
+    estadoMotor=0;// inicializamos estado motor a 0
+    analogValor=0;//inicialización lectura voltaje
+
+    // Start LoRa
+  SPI.begin(SX1278_SCK, SX1278_MISO, SX1278_MOSI, SX1278_CS);
+  LoRa.setPins(SX1278_CS, SX1278_RST, SX1278_IRQ);
+
+  if(!LoRa.begin(BAND)) {
+    Serial.println("Starting LoRa failed!");  // mensaje de error en caso de error con la
+                                                //asignación de la banda de LoRa
+    while(1);
+  }
+  Serial.print("LoRa Frequency: ");  // Mensajes de confirmación de que se ha inicializado 
+  Serial.print(BAND/1000000);        //  correctamente LoRa
+  Serial.println(" MHz");
+
+  Serial.print("LoRa Spreading Factor: ");
+  Serial.println(spreadingFactor);
+  LoRa.setSpreadingFactor(spreadingFactor);
+
+  Serial.print("LoRa Signal Bandwidth: ");
+  Serial.println(SignalBandwidth);
+  LoRa.setSignalBandwidth(SignalBandwidth);
+
+  LoRa.setCodingRate4(codingRateDenominator);
+
+  LoRa.setPreambleLength(preambleLength);
+
+  // Print an empty line
+  Serial.println();
+
+  // Wait for a second
+  delay(1000);
+    
+  }
+
+/////////Para el caudalímetro///////////////
+// son funciones hechas para medir la frecuencia de los pulsos del caudalimetro
+// Contienen interrupciones, en microcontroladores se utilizan para que ciertas acciones se ejecuten automaticamente la suceder ciertos eventos, se solucionan problemas de timing
+// no se puede medir frecuencias tan altas sin usar interrupciones en arduino porque sino se elevaria demasiado el consumo de la cpu
+
+void ISRCountPulse()
+  {
+   pulseConter++;
+  }
+ 
+float GetFrequency()
+  {
+   pulseConter = 0;
+ 
+   interrupts();
+   delay(measureInterval);
+   noInterrupts();
+ 
+   return (float)pulseConter * 1000 / measureInterval;
+  }
+
+
+
+void loop() {
+
+  
+////////////// Volumen deposito acumulador////////////////
+  
+    aire_dep=sr04.Distance(); // Distancia entre el sensor y la superficie del agua
+
+    agua_dep=HDEP-aire_dep; // Altura de agua en el deposito
+
+    volAgua=PI*(RDEP)*(RDEP)*agua_dep*0.001; // Volumen de agua en el deposito
+  
+//////////////Caudalímetro////////////////////
+
+// obtener frecuencia en Hz
+   float frequency = GetFrequency(); // llama a la funcion que calcula la frecuencia y fuarda su resultado en la variable frequency
+ 
+   // calcular caudal L/min
+   float flow_Lmin = frequency / factorK; // Valor del caudal
+ 
+
+///////////Profundidad pozo////////////////
+// keller26Y pressure sensor range from 100 mbar to 10 bar (1m water column to 100m water column)
+//100mbar-> 0V -> 0 bytes       10bar-> 5V -> 1023 bytes
+// Segun las dimensiones de nuestro pozo el sensor esta situado 80 metros de profundidad 
+//El nivel del agua puede estar entre 75m y 60m de profundidad
+// el sensor estara midiendo presiones entre 20 mca y 5 mca correspondientes a la presión del agua, más la presión atmosférica. (3.0 bar y 1.5 bar.) 
+//1,96bar -> 201 bytes 0,49 bar -> 50 bytes
+
+    pBytes=analogRead(KELLER26Y); // leemos el valor que obtenemos del sensor de presión por la entrada analógica.
+    pmBar= (pBytes*10)/1023; // Para convertir el valor en bytes a presión en mbar
+    NivelAgua= (pmBar/0,1)-10-80; //Convertimos el valor en bares a metros de agua (1 mca son 0,1 bar)-restando la presión atmosferica (10 mca) y restado la profundidad a la que se encuentra la sonda (80metros), y nos da el nivel del agua respecto a la superficia
+    
+
+/////////////Carga en pila ///////// Convirtiendo la tensión de la bateria a una tensión <5V
+
+ // La entrada analogica de arduino es de 10 bits por lo que tiene una entrada de 0 a 1023 
+      
+      analogValor=analogRead(PILA); // Leemos el valor de la entrada analogica 0 y la guardamos en una variable
+                                   // 0.00488= 5/1023
+      voltajeArd= analogValor*0.00488; // para sacar la tensión hacemos una regla de tres con los bits de la entrada analogica y la tensión de entrada (la entrada de arduino solo puede trabajar con tensiones de 0-5V)
+ 
+      //Calculo del voltaje de la bateria
+      voltajeBat=(voltajeArd*100)/5; // Convertimos de escala 0-5V a 0-100V 
+      
+      //Calculo del porcentaje de carga de  la bateria 
+      // se inician una serie de condicionales para determinar el porcentaje de carga de la bateria dependiendo del voltaje 
+      if (voltajeBat>87.5)   // mapeo de 87.5 a 91 voltios corresponde al 80% a 100% de carga
+      {cargaBat100=map(voltajeBat, 87.5, 91, 80, 100);}
+      if (voltajeBat>86.1)   // mapeo de 86.1 a 87.5 voltios corresponde al 60% a 80% de carga
+      {cargaBat100=map(voltajeBat, 86.1, 87.5, 60, 80);}
+      if (voltajeBat>84.7)   // mapeo de 84.7 a 86.1 voltios corresponde al 40% a 60% de carga
+      {cargaBat100=map(voltajeBat, 84.7, 86.1, 40, 60);}
+      if (voltajeBat>83.3)   // mapeo de 83.3 a 84.7 voltios corresponde al 20% a 40% de carga
+      {cargaBat100=map(voltajeBat, 83.3, 84.7, 20, 40);}
+      if (voltajeBat<83.3)   // mapeo de 81.2 a 83.3 voltios corresponde al 0% a 20% de carga
+      {cargaBat100=map(voltajeBat, 81.2, 83.3, 0, 20);}
+      
+      
+
+//// Deternminación de los rangos de funcionamiento de la bomba
+/// Condición rango de bateria: se pone en marcha cuando superado el 60% de carga, y se interrumpa su funcionamiento cuando desciende al 30%,
+/// Condición rango del deposito: se puede llenar hasta llegar al 99%, y no se puede volver a llenar hasta que desciende al 95%
+
+    if (cargaBat100>60) //si la capaciadad de carga de la bateria supera el 60%
+    {rangeBat=1;} // Se pone en 1 la variable que indica que la bateria puede suministrar carga al motor o no
+    if (cargaBat100<92.5); //si la capaciadad de carga de la bateria desciende por debajo del 60%
+    {rangeBat=0;} // Se pone en 0 la variable que indica que se puede suministrar carga al motor
+    if (agua_dep>198) // si la altura del agua en el deposito llega a 198 cm (99% de su capacidad)
+    {rangeTank=0;} // se pone a 0, la variable que muestra que el deposito está practicamente lleno
+    if (agua_dep<190); //si la altura del agua en el deposito llega a 190 cm (95% de su capacidad)
+    {rangeTank=1;} // se pone en 1, la variable que muestra que el deposito todavía admite la entrada de agua
+     
+
+////// Condiciones para puesta en marcha del motor de la bomba: rango de la bateria y rango del deposito activos (=1) y el nivel del agua en el pozo por encima de los 75 metros de profundidad
+
+    if ((rangeBat==1)&&(rangeTank==1)&&(NivelAgua>-75)) //la bomba se pone en marcha si la bateria está en el rango, el deposito admite más agua, y el nivel de agua en el pozo es el adecuado
+    {
+      digitalWrite(M_ON, HIGH);//Motor is on
+      estadoMotor=1; // se pone en uno la variable que indica el estado del motor
+      Serial.println("Motor ON");
+    }
+    else 
+    {
+      digitalWrite(M_ON, LOW);//Motor is off
+      estadoMotor=0; // se pone a cero la variable que indica el estado del motor.
+      Serial.println("Motor OFF");
+    }
+
+///// Visualización en el IDE Arduino
+
+    Serial.println("Voltaje Bateria");
+    Serial.print(voltajeBat);//Imprime Nivel de Bateria (voltios)
+    Serial.print(" Voltios ");
+    Serial.print(cargaBat100);
+    Serial.println("%");
+    Serial.println("Nivel del agua en el pozo");
+    Serial.println(NivelAgua);//Imprime nivel del agua en el pozo (metros)
+    Serial.print(" Metros");
+    Serial.println("Volumen de agua en el deposito acumulador: ");
+    Serial.print(volAgua); // imprime por pantalla el valor del volumen del agua en el acumulador en litros.
+    Serial.println(" Litros"); //
+    Serial.println(" ");
+    Serial.print("Frecuencia: ");
+    Serial.print(frequency, 0); //saca la frecuencia sin decimales
+    Serial.print(" (Hz)\tCaudal: ");
+    Serial.print(flow_Lmin, 3); // saca por pantallla el caudal con 3 decimales
+    Serial.println(" (L/min)");
+
+    delay(2000);//delays 2000ms 
+
+//// Transmision LoRa
+  LoRa.beginPacket();
+  LoRa.print("Nuevos Datos ;");
+  LoRa.print(voltajeBat);
+  LoRa.print(" ; "); // separadores en el mensaje para filtrar mas facil los datos en el gateway
+  LoRa.print(cargaBat100);
+  LoRa.print(" ; ");
+  LoRa.print(NivelAgua);
+  LoRa.print(" ; ");
+  LoRa.print(volAgua);
+  LoRa.print(" ; ");
+  LoRa.print(flow_Lmin, 3);
+  LoRa.print(" ; ");
+  LoRa.endPacket();
+  
+  
+    delay(2000);//delays 2000ms 
+  }
+
+    
